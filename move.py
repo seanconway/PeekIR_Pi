@@ -108,7 +108,7 @@ Quick CLI usage examples:
 
 Main Commands:
   next             Move along the discrete vector list to the next vertical break
-  origin           Move to origin (first coordinate in the vector list)
+  origin           Home to (0, 0) bottom-left via limit switches
   reset            Recalibrate current position to the start of the vector list (Origin) without moving
   up/down/left/right [=mm]
                    Move that direction by either the optional mm amount or the default step size
@@ -977,106 +977,45 @@ def main_logic():
         stopAllMotor()
         return
 
-    # Check for origin command (supports origin, origin=top, origin=bottom)
-    origin_arg = None
-    for arg in sys.argv:
-        if arg == "origin":
-            origin_arg = "top" # Default
-        elif arg.startswith("origin="):
-            origin_arg = arg.split("=")[1].lower()
+    # Check for origin command -- homes to bottom-left (0, 0) via limit switches
+    origin_flag = any(arg.lstrip('-') == 'origin' for arg in sys.argv)
 
-    if origin_arg:
-        print(f"DEBUG: Executing 'origin' command (Target: {origin_arg})")
-        
-        if origin_arg == "bottom":
-            # Homing to Bottom-Left (Left/Down 1000mm)
-            print("Homing to physical origin (Left/Down 1000mm)...")
-            
-            # Move Left 1000
-            dirX.off() # Left
-            pulX.start(duty_cycle)
-            x_running = True
-            
-            # Move Down 1000
-            dirY.off() # Down (CCW)
-            pulY.start(duty_cycle)
-            y_running = True
-            
-            target_y_pos = 0 # Bottom
-        else:
-            # Default: Homing to Top-Left (Left/Up 1000mm)
-            print("Homing to physical origin (Left/Up 1000mm)...")
-            
-            # Move Left 1000
-            dirX.off() # Left
-            pulX.start(duty_cycle)
-            x_running = True
-            
-            # Move Up 1000
-            dirY.on() # Up (CW)
-            pulY.start(duty_cycle)
-            y_running = True
-            
-            target_y_pos = 636 # Top
+    if origin_flag:
+        print("Homing to origin (0, 0) -- driving left and down until limit switches...")
 
-        # Calculate duration for 1000mm
-        duration_x = 1000 / speedX_mm_per_s
-        duration_y = 1000 / speedY_mm_per_s
-        max_duration = max(duration_x, duration_y)
-        
-        print(f"Moving for {max_duration:.2f}s (monitoring limits)...")
-        
+        dirX.off()  # Left
+        pulX.start(duty_cycle)
+        x_running = True
+
+        dirY.off()  # Down (CCW)
+        pulY.start(duty_cycle)
+        y_running = True
+
+        # Allow enough time to traverse the full gantry even from the far corner
+        max_duration = 1000 / min(speedX_mm_per_s, speedY_mm_per_s)
+
         start_time = time()
         while (time() - start_time < max_duration) and (x_running or y_running):
             limits = get_triggered_limits()
-            
-            # Check X Limit (Left -> X_MIN)
-            if x_running:
-                if 'X_MIN' in limits:
-                    print("X Limit (Left/Min) hit. Stopping X.")
-                    pulX.stop()
-                    x_running = False
-                elif time() - start_time > duration_x:
-                     pulX.stop()
-                     x_running = False
 
-            # Check Y Limit
-            if y_running:
-                if origin_arg == "bottom":
-                    # Moving Down -> Check Y_MIN
-                    if 'Y_MIN' in limits:
-                        print("Y Limit (Down/Min) hit. Stopping Y.")
-                        pulY.stop()
-                        y_running = False
-                    elif time() - start_time > duration_y:
-                        pulY.stop()
-                        y_running = False
-                else:
-                    # Moving Up -> Check Y_MAX
-                    if 'Y_MAX' in limits:
-                        print("Y Limit (Up/Max) hit. Stopping Y.")
-                        pulY.stop()
-                        y_running = False
-                    elif time() - start_time > duration_y:
-                        pulY.stop()
-                        y_running = False
-            
+            if x_running and 'X_MIN' in limits:
+                print("X_MIN limit hit. Stopping X.")
+                pulX.stop()
+                x_running = False
+
+            if y_running and 'Y_MIN' in limits:
+                print("Y_MIN limit hit. Stopping Y.")
+                pulY.stop()
+                y_running = False
+
             sleep(0.01)
-        
-        stopAllMotor()
-        
-        originX = 0
-        originY = target_y_pos
-        
-        print(f"Homing complete. Setting position to ({originX}, {originY})")
 
-        # stop and save new position (origin); update index to 0
+        stopAllMotor()
+
+        print("Homing complete. Position set to (0, 0).")
         with open('current_index.txt', 'w') as f:
             f.write('0')
-        
-        # We need to save the coords too
-        coords_inset = apply_margin(vectorListDiscrete, MARGIN_MM)
-        save_position(originX, originY, coords_inset)
+        save_position(0, 0)
         return
 
     if "reset" in sys.argv:
