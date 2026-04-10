@@ -16,7 +16,7 @@
 local SERVER_HOST = "127.0.0.1"   -- Coordinator IP (localhost if on same Windows machine)
 local SERVER_PORT = 5555
 
-local num_frames = 800
+local num_frames = 100
 local frame_periodicity = 18      -- ms
 local capture_buffer_ms = 1000    -- extra wait after frame for DCA1000 flush
 
@@ -74,6 +74,15 @@ ar1.CaptureCardConfig_Mode(1, 2, 1, 2, 3, 30)
 ar1.CaptureCardConfig_PacketDelay(25)
 
 WriteToLog("Sensor initialized.\n", "green")
+
+-- Warm up DCA1000 with a dummy capture to flush internal state.
+-- The first StartRecord after init often fails to write to disk.
+WriteToLog("Warming up DCA1000 (dummy capture)...\n", "blue")
+ar1.CaptureCardConfig_StartRecord("C:\\temp\\dca_warmup_dummy.bin", 1)
+RSTD.Sleep(50)
+ar1.CaptureCardConfig_StopRecord()
+RSTD.Sleep(200)
+WriteToLog("DCA1000 warmup complete.\n", "green")
 
 -- =================================================================================
 -- CONNECT TO COORDINATOR
@@ -138,6 +147,8 @@ while true do
             local wait_ms = (num_frames * frame_periodicity) + capture_buffer_ms
             WriteToLog("Capturing for " .. wait_ms .. "ms...\n", "black")
             RSTD.Sleep(wait_ms)
+            ar1.CaptureCardConfig_StopRecord()
+            RSTD.Sleep(50)
             WriteToLog("Capture complete.\n", "green")
             tcp_send(tcp, "CAPTURE_DONE")
         else

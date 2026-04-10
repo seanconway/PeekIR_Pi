@@ -6,10 +6,12 @@ from matplotlib.widgets import Slider
 from scipy.fft import fft, fft2, ifft2, fftshift
 
 
-def load_data_cube(filename, samples, X, Y, option):
+def load_data_cube(filename, samples, X, Y, option, snake=False):
     """
     Load binary data and format into a 3D data cube.
     Replicates loadDataCube.m behavior.
+    snake: if True, reverse X for even rows (bidirectional scan).
+           if False, all rows are left-to-right (unidirectional scan).
     """
     try:
         with open(filename, 'rb') as f:
@@ -128,43 +130,25 @@ def load_data_cube(filename, samples, X, Y, option):
             
             slice_data = full_channel_data[x*samples : (x+1)*samples]
             
-            # Snake pattern logic
-            # MATLAB: if rem(y, 2) == 1 (odd) -> data_cube(:, y, x)
-            # else -> data_cube(:, y, X + 1 - x)
-            # Python y is 0-indexed. y=0 corresponds to MATLAB y=1 (odd).
-            # So if y % 2 == 0 (Python even, MATLAB odd) -> normal
-            
-            if (y + 1) % 2 == 1: # Odd in MATLAB terms
-                data_cube[:, y, x] = slice_data * w
-            else:
+            if snake and (y + 1) % 2 == 0:
                 data_cube[:, y, X - 1 - x] = slice_data * w
+            else:
+                data_cube[:, y, x] = slice_data * w
 
     return data_cube
 
 
-def stack(samples, X, Y, option, data_dir, filename_fn):
+def stack(samples, X, Y, option, data_dir, filename_fn, snake=False):
     """
     Load data cubes and stack them along the Y dimension.
     """
-    # Initialize 3D array
-    # MATLAB: dataStack = zeros(samples, Y, X);
     data_stack = np.zeros((samples, Y, X), dtype=np.complex128)
     
-    for y in range(Y): # 0 to Y-1
-        # MATLAB y is 1-based. filename_fn expects 1-based index?
-        # mainSARORIGINAL: filenameFn = @(y) "scan" + y + "_Raw_0.bin";
-        # So we should pass y+1.
-        
+    for y in range(Y):
         filename = filename_fn(y + 1)
         filepath = os.path.join(data_dir, filename)
         
-        # loadDataCube called with Y=1
-        # MATLAB: loadDataCube(filepath, samples, X, 1, option)
-        # Returns (samples, 1, X)
-        cube = load_data_cube(filepath, samples, X, 1, option)
-        
-        # Assign to data_stack
-        # MATLAB: dataStack(:, y, :) = ...
+        cube = load_data_cube(filepath, samples, X, 1, option, snake=snake)
         data_stack[:, y, :] = cube[:, 0, :]
         
     return data_stack
@@ -533,7 +517,7 @@ def main():
     parser.add_argument('--fista_lambda', type=float, default=0.05, help="FISTA regularization ratio (0.0 to 1.0)")
 
     # Scan parameters (must match sar_coordinator.py settings)
-    parser.add_argument('--frames', type=int, default=800, help='Frames per row (X dimension, default 800)')
+    parser.add_argument('--frames', type=int, default=100, help='Frames per row (X dimension, default 100)')
     parser.add_argument('--rows', type=int, default=40, help='Number of scan rows (Y dimension, default 40)')
     parser.add_argument('--samples', type=int, default=512, help='ADC samples per chirp (default 512)')
     parser.add_argument('--speed', type=float, default=18, help='Scan speed in mm/s (default 18)')
@@ -541,9 +525,12 @@ def main():
     parser.add_argument('--y-step', type=float, default=1.0, help='Y step between rows in mm (default 1.0)')
     parser.add_argument('--scan-width', type=float, default=280, help='Horizontal scan width in mm (default 280)')
     parser.add_argument('--scan-height', type=float, default=40, help='Vertical scan height in mm (default 40)')
-    parser.add_argument('--filename-pattern', type=str, default='row_{y}.bin',
+    parser.add_argument('--filename-pattern', type=str, default='row_{y}_Raw_0.bin',
                         help="Filename pattern for row data. Use {y} for 1-based row index "
-                             "(default 'row_{y}.bin', legacy: 'scan{y}_Raw_0.bin')")
+                             "(default 'row_{y}_Raw_0.bin', legacy: 'scan{y}_Raw_0.bin')")
+    parser.add_argument('--snake', action='store_true',
+                        help="Enable snake/boustrophedon scan pattern (reverses even rows). "
+                             "Only use if the gantry scans bidirectionally.")
     args = parser.parse_args()
 
     # Configuration
@@ -556,7 +543,7 @@ def main():
         return args.filename_pattern.format(y=y)
 
     print(f"Loading data from '{data_dir}' ({Y} rows x {X} frames, pattern: {args.filename_pattern})...")
-    raw_data = stack(samples, X, Y, 1, data_dir, filename_fn)
+    raw_data = stack(samples, X, Y, 1, data_dir, filename_fn, snake=args.snake)
 
     # Spatial step sizes derived from scan speed and frame periodicity
     n_fft_time = 1024
@@ -644,9 +631,8 @@ def main():
         scan_width_x = args.scan_width
         scan_height_y = args.scan_height
         
-        # Use a larger display size to see the full reconstruction (beyond the scan area)
-        display_width_x = 400
-        display_height_y = 300
+        display_width_x = scan_width_x * 1.3
+        display_height_y = scan_height_y * 1.3
         
         if args.algo == 'fista':
              sar_image, x_axis, y_axis = reconstruct_sar_image_fista(sar_data, matched_filter, dx, dy, display_width_x, display_height_y, args.fista_iters, args.fista_lambda)

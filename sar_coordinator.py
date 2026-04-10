@@ -158,18 +158,36 @@ def run_scan(gantry, radar, args):
     print(f"{'=' * 60}\n")
 
     # ------------------------------------------------------------------
-    # 1. Configure radar
+    # 1. Configure radar and warm up DCA1000
     # ------------------------------------------------------------------
-    print("[1/3] Configuring radar...")
+    print("[1/4] Configuring radar...")
     radar.send(f"CONFIGURE {num_frames} {int(frame_periodicity)}")
     radar.expect("CONFIGURED")
-    print("      Radar configured.\n")
+    print("      Radar configured.")
+
+    # Run a dummy ARM+CAPTURE cycle so the DCA1000 is fully warmed up.
+    # The first real StartRecord after initialization often fails to write.
+    print("      Warming up DCA1000 (dummy capture)...")
+    dummy_path = f"{output_dir}{sep}_warmup_dummy.bin"
+    radar.send(f"ARM {dummy_path}")
+    resp = radar.recv(timeout=30)
+    if resp == "ARMED":
+        radar.send("CAPTURE")
+        radar.recv(timeout=60)  # wait for CAPTURE_DONE
+    # Clean up the dummy file
+    try:
+        import glob as _glob
+        for f in _glob.glob(dummy_path.replace(".bin", "*")):
+            os.remove(f)
+    except Exception:
+        pass
+    print("      DCA1000 ready.\n")
 
     # ------------------------------------------------------------------
     # 2. Move gantry to start position (if not at origin)
     # ------------------------------------------------------------------
     if x_start > 0 or y_start > 0:
-        print(f"[2/3] Moving to start ({x_start}, {y_start})...")
+        print(f"[2/4] Moving to start ({x_start}, {y_start})...")
         parts = []
         if x_start > 0:
             parts.append(f"right={x_start}mm")
@@ -180,12 +198,17 @@ def run_scan(gantry, radar, args):
         gantry.expect("MOVE_COMPLETE", timeout=120)
         print("      At start position.\n")
     else:
-        print("[2/3] Start at current position.\n")
+        print("[2/4] Start at current position.\n")
 
     # ------------------------------------------------------------------
-    # 3. Row-by-row scan
+    # 3. Verify DCA1000 with a real test row (optional sanity check)
     # ------------------------------------------------------------------
-    print(f"[3/3] Scanning {num_rows} rows...\n")
+    print("[3/4] Ready to scan.\n")
+
+    # ------------------------------------------------------------------
+    # 4. Row-by-row scan
+    # ------------------------------------------------------------------
+    print(f"[4/4] Scanning {num_rows} rows...\n")
     scan_start = time.time()
 
     for row in range(1, num_rows + 1):
