@@ -23,6 +23,7 @@ import json
 import tty
 import termios
 import select
+import socket as socket_module
 
 # Global event to signal threads to stop
 shutdown_event = threading.Event()
@@ -285,6 +286,158 @@ def close():
     dirX.close()
     pulY.stop()
     dirY.close()
+
+
+def set_speed(mm_per_s):
+    """Update PWM frequency and speed globals for both axes."""
+    global f_x, f_y, speedX_rev_per_s, speedX_mm_per_s
+    global speedY_rev_per_s, speedY_mm_per_s
+
+    new_freq = int(mm_per_s * (steps_per_rev / length_per_rev))
+    pulX.change_frequency(new_freq)
+    pulY.change_frequency(new_freq)
+
+    f_x = new_freq
+    f_y = new_freq
+    speedX_rev_per_s = f_x / steps_per_rev
+    speedX_mm_per_s = speedX_rev_per_s * length_per_rev
+    speedY_rev_per_s = f_y / steps_per_rev
+    speedY_mm_per_s = speedY_rev_per_s * length_per_rev
+
+
+# ---------------------------------------------------------------------------
+# TCP Client Mode
+# ---------------------------------------------------------------------------
+def _tcp_send(sock, msg):
+    sock.sendall((msg + "\n").encode())
+
+def _tcp_recv(sock, buf_holder):
+    """Receive one newline-delimited message. buf_holder is a [str] list for buffering."""
+    while "\n" not in buf_holder[0]:
+        data = sock.recv(4096)
+        if not data:
+            raise ConnectionError("Coordinator disconnected")
+        buf_holder[0] += data.decode()
+    line, buf_holder[0] = buf_holder[0].split("\n", 1)
+    return line.strip()
+
+def _tcp_execute_move(sock, args_str):
+    """Parse MOVE arguments and execute the movement, sending status over TCP."""
+    tokens = args_str.split()
+    directions = {}
+    speed_val = None
+
+    for token in tokens:
+        if '=' not in token:
+            continue
+        key, val = token.split('=', 1)
+        if key in ('up', 'down', 'left', 'right'):
+            dist_str = val.lower()
+            if dist_str.endswith('mm'):
+                dist_str = dist_str[:-2]
+            try:
+                directions[key] = float(dist_str)
+            except ValueError:
+                _tcp_send(sock, f"ERROR bad distance: {val}")
+                return
+        elif key == 'speed':
+            spd = parse_speed(val)
+            if spd is not None:
+                speed_val = spd
+
+    if not directions:
+        _tcp_send(sock, "ERROR no direction in MOVE command")
+        return
+
+    if speed_val is not None:
+        set_speed(speed_val)
+
+    dx = 0.0
+    dy = 0.0
+    for d, dist in directions.items():
+        if d == 'right':  dx += dist
+        elif d == 'left': dx -= dist
+        elif d == 'up':   dy += dist
+        elif d == 'down': dy -= dist
+
+    # Start motors
+    if dx != 0:
+        (dirX.on if dx > 0 else dirX.off)()
+        pulX.start(duty_cycle)
+    if dy != 0:
+        (dirY.on if dy > 0 else dirY.off)()
+        pulY.start(duty_cycle)
+
+    _tcp_send(sock, "MOTOR_STARTED")
+
+    timeX = abs(dx) / speedX_mm_per_s if dx != 0 else 0
+    timeY = abs(dy) / speedY_mm_per_s if dy != 0 else 0
+
+    if timeX > 0 and timeY > 0:
+        if timeX <= timeY:
+            sleep_with_limit_check(timeX, 'x', 1 if dx > 0 else -1)
+            pulX.stop()
+            if timeY - timeX > 0:
+                sleep_with_limit_check(timeY - timeX, 'y', 1 if dy > 0 else -1)
+            pulY.stop()
+        else:
+            sleep_with_limit_check(timeY, 'y', 1 if dy > 0 else -1)
+            pulY.stop()
+            if timeX - timeY > 0:
+                sleep_with_limit_check(timeX - timeY, 'x', 1 if dx > 0 else -1)
+            pulX.stop()
+    elif timeX > 0:
+        sleep_with_limit_check(timeX, 'x', 1 if dx > 0 else -1)
+        pulX.stop()
+    elif timeY > 0:
+        sleep_with_limit_check(timeY, 'y', 1 if dy > 0 else -1)
+        pulY.stop()
+
+    _tcp_send(sock, "MOVE_COMPLETE")
+
+def tcp_client_mode(host, port):
+    """Connect to SAR coordinator and execute gantry movement commands."""
+    print(f"Connecting to coordinator at {host}:{port}...")
+    s = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    s.connect((host, int(port)))
+    print("Connected.")
+
+    _tcp_send(s, "GANTRY")
+
+    buf = [""]
+    try:
+        while True:
+            cmd = _tcp_recv(s, buf)
+            print(f"CMD: {cmd}")
+
+            if cmd == "PING":
+                _tcp_send(s, "PONG")
+            elif cmd == "STOP":
+                stopAllMotor()
+                _tcp_send(s, "STOPPED")
+            elif cmd == "SHUTDOWN":
+                stopAllMotor()
+                _tcp_send(s, "OK")
+                break
+            elif cmd.startswith("MOVE "):
+                _tcp_execute_move(s, cmd[5:])
+            elif cmd.startswith("SPEED "):
+                spd = parse_speed(cmd[6:].strip())
+                if spd is not None:
+                    set_speed(spd)
+                    _tcp_send(s, "SPEED_SET")
+                else:
+                    _tcp_send(s, "ERROR bad speed value")
+            else:
+                _tcp_send(s, f"ERROR unknown command: {cmd}")
+    except KeyboardInterrupt:
+        print("\nTCP client interrupted")
+    except ConnectionError as e:
+        print(f"Connection lost: {e}")
+    finally:
+        stopAllMotor()
+        s.close()
+        print("TCP client disconnected.")
 
 
 def monitor_emergency_stop():
@@ -791,6 +944,19 @@ def parse_speed(v):
     return None
 
 def main_logic():
+    # TCP client mode: connect to SAR coordinator for real-time gantry control
+    #   python3 move.py tcp host=<ip> port=<port>
+    if "tcp" in sys.argv:
+        host = "127.0.0.1"
+        port = 5555
+        for arg in sys.argv:
+            if arg.startswith("--host=") or arg.startswith("host="):
+                host = arg.split("=", 1)[1]
+            if arg.startswith("--port=") or arg.startswith("port="):
+                port = int(arg.split("=", 1)[1])
+        tcp_client_mode(host, port)
+        return
+
     # Check for silent mode to suppress output
     # We use 'silent' (no dashes) to avoid confusion with uv flags
     if "silent" in sys.argv or "--no-debug" in sys.argv:
@@ -817,32 +983,8 @@ def main_logic():
 
     # Apply speed override if present
     if target_speed_mm_s is not None:
-        global f_x, f_y, speedX_rev_per_s, speedX_mm_per_s
-        global speedY_rev_per_s, speedY_mm_per_s
-
-        # Calculate new frequency
-        # f = speed_mm_s * steps_per_mm
-        # steps_per_mm = steps_per_rev / length_per_rev
-        new_freq = int(target_speed_mm_s * (steps_per_rev / length_per_rev))
-        
-        print(f"DEBUG: Speed requested: {target_speed_mm_s} mm/s")
-        print(f"DEBUG: New Frequency: {new_freq} Hz")
-        
-        # Update hardware PWM
-        pulX.change_frequency(new_freq)
-        pulY.change_frequency(new_freq)
-        
-        # Update global speed variables for sleep calculations
-        f_x = new_freq
-        f_y = new_freq
-        
-        speedX_rev_per_s = f_x / steps_per_rev
-        speedX_mm_per_s = speedX_rev_per_s * length_per_rev
-
-        speedY_rev_per_s = f_y / steps_per_rev
-        speedY_mm_per_s = speedY_rev_per_s * length_per_rev
-        
-        print(f"DEBUG: Calculated Speed: {speedX_mm_per_s:.2f} mm/s")
+        set_speed(target_speed_mm_s)
+        print(f"DEBUG: Speed set to {speedX_mm_per_s:.2f} mm/s ({f_x} Hz)")
     else:
         print(f"DEBUG: Default Speed: {speedX_mm_per_s:.2f} mm/s")
 
