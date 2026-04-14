@@ -531,6 +531,16 @@ def main():
     parser.add_argument('--snake', action='store_true',
                         help="Enable snake/boustrophedon scan pattern (reverses even rows). "
                              "Only use if the gantry scans bidirectionally.")
+    parser.add_argument('--window', type=str, default='none', choices=['none', 'hanning', 'hamming', 'kaiser'],
+                        help="Range FFT window function (default: none). "
+                             "'none' gives best depth resolution; 'hanning'/'hamming' suppress sidelobes at cost of wider mainlobe.")
+    parser.add_argument('--kaiser-beta', type=float, default=6.0,
+                        help="Kaiser window beta parameter (default 6.0). Higher = narrower mainlobe but more sidelobes.")
+    parser.add_argument('--db', action='store_true',
+                        help="Display heatmaps in dB scale (log10) for sharper contrast.")
+    parser.add_argument('--db-range', type=float, default=40.0,
+                        help="Dynamic range in dB when --db is used (default 40). "
+                             "Lower values (e.g. 20) show only the strongest features.")
     args = parser.parse_args()
 
     # Configuration
@@ -557,10 +567,21 @@ def main():
     Ts = 1/fS
     K = 63.343e12
 
-    # Range FFT
-    print("Processing Range FFT...")
-    # MATLAB: fft(rawData, nFFTtime) -> operates on first dimension (samples)
-    raw_data_fft = fft(raw_data, n=n_fft_time, axis=0)
+    # Range FFT (optional window to trade depth resolution for sidelobe suppression)
+    print(f"Processing Range FFT (window={args.window})...")
+    if args.window == 'hanning':
+        window = np.hanning(samples).reshape(-1, 1, 1)
+    elif args.window == 'hamming':
+        window = np.hamming(samples).reshape(-1, 1, 1)
+    elif args.window == 'kaiser':
+        window = np.kaiser(samples, args.kaiser_beta).reshape(-1, 1, 1)
+    else:
+        window = None
+
+    if window is not None:
+        raw_data_fft = fft(raw_data * window, n=n_fft_time, axis=0)
+    else:
+        raw_data_fft = fft(raw_data, n=n_fft_time, axis=0)
 
     # Z-axis iteration parameters
     # Original code used z0 = 323mm. We sweep around this value.
@@ -652,51 +673,60 @@ def main():
 
     sar_stack = np.array(sar_stack) # Shape (N_z, Y, X)
 
+    def to_db(data, db_range):
+        """Convert magnitude data to dB with clamped dynamic range."""
+        peak = np.max(data)
+        if peak == 0:
+            return data
+        db = 20 * np.log10(data / peak + 1e-12)
+        return np.clip(db, -db_range, 0)
+
+    use_db = args.db
+    db_range = args.db_range
+    clabel = 'dB' if use_db else 'Intensity'
+
     # Generate Heatmaps
-    print("Generating Heatmaps...")
+    print(f"Generating Heatmaps{' (dB scale, ' + str(db_range) + ' dB range)' if use_db else ''}...")
 
     # 1. Maximum Intensity Projection along Y axis (View X vs Z)
-    # sar_stack is (Z, Y, X). Max over axis 1 (Y). Result (Z, X).
     if not args.xyonly:
         mip_xz = np.max(sar_stack, axis=1)
+        plot_data = to_db(mip_xz, db_range) if use_db else mip_xz
 
         plt.figure(figsize=(10, 6))
-        # pcolormesh expects X, Y. Here X is x_axis, Y is z_values.
-        # mip_xz shape is (Z, X).
-        plt.pcolormesh(x_axis, z_values, mip_xz, cmap='jet', shading='gouraud')
+        plt.pcolormesh(x_axis, z_values, plot_data, cmap='jet', shading='gouraud')
         plt.xlabel('Horizontal (mm)')
         plt.ylabel('Depth Z (mm)')
         plt.title('SAR X-Z Maximum Intensity Projection')
-        plt.colorbar(label='Intensity')
+        plt.colorbar(label=clabel)
         plt.savefig('sar_heatmap_xz.png')
         print("Saved X-Z heatmap to sar_heatmap_xz.png")
 
     # 2. Maximum Intensity Projection along X axis (View Y vs Z)
-    # sar_stack is (Z, Y, X). Max over axis 2 (X). Result (Z, Y).
     if not args.xyonly:
         mip_yz = np.max(sar_stack, axis=2)
+        plot_data = to_db(mip_yz, db_range) if use_db else mip_yz
 
         plt.figure(figsize=(10, 6))
-        # pcolormesh expects X, Y. Here X is y_axis, Y is z_values.
-        plt.pcolormesh(y_axis, z_values, mip_yz, cmap='jet', shading='gouraud')
+        plt.pcolormesh(y_axis, z_values, plot_data, cmap='jet', shading='gouraud')
         plt.xlabel('Vertical (mm)')
         plt.ylabel('Depth Z (mm)')
         plt.title('SAR Y-Z Maximum Intensity Projection')
-        plt.colorbar(label='Intensity')
+        plt.colorbar(label=clabel)
         plt.savefig('sar_heatmap_yz.png')
         print("Saved Y-Z heatmap to sar_heatmap_yz.png")
 
     # 3. Best Focus Image (Max over Z)
-    # Max over axis 0 (Z). Result (Y, X).
     mip_xy = np.max(sar_stack, axis=0)
+    plot_data = to_db(mip_xy, db_range) if use_db else mip_xy
 
     plt.figure(figsize=(10, 6))
-    plt.pcolormesh(x_axis, y_axis, mip_xy, cmap='jet', shading='gouraud')
+    plt.pcolormesh(x_axis, y_axis, plot_data, cmap='jet', shading='gouraud')
     plt.xlabel('Horizontal (mm)')
     plt.ylabel('Vertical (mm)')
     plt.title('SAR X-Y Maximum Intensity Projection (All Z)')
     plt.axis('equal')
-    plt.colorbar(label='Intensity')
+    plt.colorbar(label=clabel)
     plt.savefig('sar_heatmap_xy_max.png')
     print("Saved X-Y max projection to sar_heatmap_xy_max.png")
 

@@ -181,6 +181,9 @@ def run_scan(gantry, radar, args):
             os.remove(f)
     except Exception:
         pass
+    # DCA1000 needs time between StopRecord and the next StartRecord
+    # to finalize the previous file. Without this, row_1 gets silently dropped.
+    time.sleep(3)
     print("      DCA1000 ready.\n")
 
     # ------------------------------------------------------------------
