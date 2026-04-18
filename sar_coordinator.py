@@ -11,6 +11,7 @@ Recommended setup:
 Usage:
     python sar_coordinator.py -W 280 -H 40 -r 40 -o "C:\\path\\to\\data"
     python sar_coordinator.py -W 280 -H 40 -x 0 -y 0 -r 40 -s 18 --return-speed 36 -o "C:\\data"
+    python sar_coordinator.py -W 280 -H 40 -r 40 --snake -o "C:\\data"   # boustrophedon (use sar_reconstruct.py --snake)
 
 Protocol (newline-delimited text, two persistent TCP connections):
 
@@ -130,6 +131,7 @@ def run_scan(gantry, radar, args):
     frame_periodicity = args.frame_periodicity
     stabilization_ms = args.stabilization
     output_dir = args.output_dir
+    snake = args.snake
 
     y_step = args.y_step if args.y_step is not None else (
         height / (num_rows - 1) if num_rows > 1 else 0
@@ -154,6 +156,9 @@ def run_scan(gantry, radar, args):
     print(f"  Frames/row:   {num_frames} @ {frame_periodicity} ms "
           f"= {num_frames * frame_periodicity:.0f} ms capture")
     print(f"  Stabilize:    {stabilization_ms} ms")
+    print(f"  Snake scan:   {'yes (odd rows →, even rows ←)' if snake else 'no (return after each row)'}")
+    if snake:
+        print(f"  DCA gap:      {args.dca_record_gap}s after each row (StopRecord → next ARM)")
     print(f"  Output:       {output_dir}")
     print(f"{'=' * 60}\n")
 
@@ -183,7 +188,7 @@ def run_scan(gantry, radar, args):
         pass
     # DCA1000 needs time between StopRecord and the next StartRecord
     # to finalize the previous file. Without this, row_1 gets silently dropped.
-    time.sleep(3)
+    time.sleep(0.1)
     print("      DCA1000 ready.\n")
 
     # ------------------------------------------------------------------
@@ -218,7 +223,9 @@ def run_scan(gantry, radar, args):
         filepath = f"{output_dir}{sep}row_{row}.bin"
         row_start = time.time()
 
-        print(f"--- Row {row}/{num_rows} ---")
+        scan_right = True if not snake else (row % 2 == 1)
+        dir_label = "right" if scan_right else "left"
+        print(f"--- Row {row}/{num_rows} ({dir_label}) ---")
 
         # ARM DCA1000
         radar.send(f"ARM {filepath}")
@@ -227,8 +234,11 @@ def run_scan(gantry, radar, args):
             print(f"  ARM failed: {resp}")
             return
 
-        # Start gantry scan movement
-        gantry.send(f"MOVE right={width}mm speed={speed}mms")
+        # Start gantry scan movement (snake: odd rows →, even rows ←)
+        if scan_right:
+            gantry.send(f"MOVE right={width}mm speed={speed}mms")
+        else:
+            gantry.send(f"MOVE left={width}mm speed={speed}mms")
         gantry.expect("MOTOR_STARTED", timeout=30)
 
         # Wait for motor to reach constant speed
@@ -266,16 +276,26 @@ def run_scan(gantry, radar, args):
             print(f"  Radar unexpected: {results.get('radar')}")
             return
 
-        # Return gantry to start X
-        gantry.send(f"MOVE left={width}mm speed={return_speed}mms")
-        gantry.expect("MOTOR_STARTED", timeout=30)
-        gantry.expect("MOVE_COMPLETE", timeout=120)
+        # Without a long return move (~s), the next ARM can arrive before the DCA1000
+        # finishes writing the previous row — files may be missing or size 0 (--snake).
+        if snake:
+            time.sleep(args.dca_record_gap)
 
-        # Step up for next row
-        if row < num_rows and y_step > 0:
-            gantry.send(f"MOVE up={y_step:.2f}mm speed={speed}mms")
+        if not snake:
+            # Return gantry to start X, then step to next row
+            gantry.send(f"MOVE left={width}mm speed={return_speed}mms")
             gantry.expect("MOTOR_STARTED", timeout=30)
             gantry.expect("MOVE_COMPLETE", timeout=120)
+            if row < num_rows and y_step > 0:
+                gantry.send(f"MOVE up={y_step:.2f}mm speed={speed}mms")
+                gantry.expect("MOTOR_STARTED", timeout=30)
+                gantry.expect("MOVE_COMPLETE", timeout=120)
+        else:
+            # Stay at the far X of this row; only step up (saves return travel per row)
+            if row < num_rows and y_step > 0:
+                gantry.send(f"MOVE up={y_step:.2f}mm speed={speed}mms")
+                gantry.expect("MOTOR_STARTED", timeout=30)
+                gantry.expect("MOVE_COMPLETE", timeout=120)
 
         elapsed = time.time() - row_start
         print(f"  Row {row} done ({elapsed:.1f}s)\n")
@@ -307,14 +327,21 @@ def main():
     parser.add_argument("-s", "--speed", type=float, default=18,
                         help="Scan speed (mm/s, default 18)")
     parser.add_argument("--return-speed", type=float, default=36,
-                        help="Gantry return speed (mm/s, default 36)")
+                        help="Gantry return speed after each row (mm/s, default 36; unused with --snake)")
+    parser.add_argument("--snake", action="store_true",
+                        help="Boustrophedon scan: odd rows left→right, even rows right→left; "
+                             "no return move between rows (reconstruct with sar_reconstruct.py --snake)")
+    parser.add_argument("--dca-record-gap", type=float, default=3.0, metavar="SEC",
+                        help="Seconds to wait after each capture before the next move/ARM when "
+                             "using --snake (DCA1000 needs a gap after StopRecord; default: 3). "
+                             "Raster mode gets this gap implicitly from the return traverse.")
     parser.add_argument("--y-step", type=float, default=None,
                         help="Y step between rows (mm, overrides height-based calc)")
     parser.add_argument("--num-frames", type=int, default=None,
                         help="Frames per capture (default: auto from scan time)")
     parser.add_argument("--frame-periodicity", type=float, default=18,
                         help="Radar frame periodicity (ms, default 18)")
-    parser.add_argument("--stabilization", type=float, default=500,
+    parser.add_argument("--stabilization", type=float, default=0,
                         help="Motor stabilization delay before capture (ms, default 500)")
     parser.add_argument("-o", "--output-dir", type=str, required=True,
                         help="Output directory for .bin files (Windows path)")

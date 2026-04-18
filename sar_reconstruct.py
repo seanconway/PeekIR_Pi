@@ -1,3 +1,4 @@
+import glob
 import os
 import argparse
 import numpy as np
@@ -10,8 +11,8 @@ def load_data_cube(filename, samples, X, Y, option, snake=False):
     """
     Load binary data and format into a 3D data cube.
     Replicates loadDataCube.m behavior.
-    snake: if True, reverse X for even rows (bidirectional scan).
-           if False, all rows are left-to-right (unidirectional scan).
+    snake: if True and Y>1 in this file, reverse X for even 1-based rows.
+           Stacked multi-file scans use stack(..., snake=...) instead (each file has Y=1).
     """
     try:
         with open(filename, 'rb') as f:
@@ -138,19 +139,54 @@ def load_data_cube(filename, samples, X, Y, option, snake=False):
     return data_cube
 
 
+def resolve_row_data_path(data_dir, filename):
+    """
+    Return a path to row binary data. If the requested name is missing, try TI/mmWave
+    DCA1000 naming (e.g. row_1.bin -> row_1_Raw_0.bin, row_1_Raw_1.bin, or row_1_Raw*.bin).
+    """
+    primary = os.path.join(data_dir, filename)
+    if os.path.isfile(primary):
+        return primary
+    base, ext = os.path.splitext(filename)
+    if ext.lower() != '.bin':
+        return primary
+    for suffix in ('_Raw_0.bin', '_Raw_1.bin'):
+        alt = os.path.join(data_dir, base + suffix)
+        if os.path.isfile(alt):
+            return alt
+    matches = sorted(glob.glob(os.path.join(data_dir, base + '_Raw*.bin')))
+    if matches:
+        return matches[0]
+    return primary
+
+
 def stack(samples, X, Y, option, data_dir, filename_fn, snake=False):
     """
     Load data cubes and stack them along the Y dimension.
+    When snake is True, reverse X for even 1-based rows (2, 4, ...) to match
+    boustrophedon capture. This must be applied here: load_data_cube is called
+    with Y=1 per file, so its internal snake logic never sees even row indices.
     """
     data_stack = np.zeros((samples, Y, X), dtype=np.complex128)
-    
+    fallback_note_printed = False
+
     for y in range(Y):
         filename = filename_fn(y + 1)
-        filepath = os.path.join(data_dir, filename)
-        
-        cube = load_data_cube(filepath, samples, X, 1, option, snake=snake)
-        data_stack[:, y, :] = cube[:, 0, :]
-        
+        requested = os.path.join(data_dir, filename)
+        filepath = resolve_row_data_path(data_dir, filename)
+        if filepath != requested and os.path.isfile(filepath) and not fallback_note_printed:
+            print(
+                f"Note: using DCA-style row files (e.g. *_Raw_0.bin) "
+                f"because '{filename}' was not found under '{data_dir}'."
+            )
+            fallback_note_printed = True
+
+        cube = load_data_cube(filepath, samples, X, 1, option, snake=False)
+        row_data = cube[:, 0, :]
+        if snake and (y + 1) % 2 == 0:
+            row_data = np.conj(row_data[:, ::-1])
+        data_stack[:, y, :] = row_data
+
     return data_stack
 
 
@@ -387,14 +423,9 @@ def reconstruct_sar_image_bpa(raw_data_fft, x_step_m, y_step_m, z_target_mm,
     # Actually, let's keep bins first: (Bins, N_ap)
     data_flat = raw_data_fft.reshape(n_fft, -1)
     
-    # Image Grid
-    # We want to reconstruct an image of size (display_height_y, display_width_x)
-    # But what is the resolution?
-    # Usually we want the same resolution as the aperture step or finer.
-    # Let's use the same step size as the aperture for simplicity, but cover the display area.
-    
-    n_x_img = int(display_width_x) # Pixels
-    n_y_img = int(display_height_y) # Pixels
+    # Image grid: cover the physical scan extent (display_* == scan_* from caller)
+    n_x_img = int(display_width_x)  # Pixels spanning scan width (mm)
+    n_y_img = int(display_height_y)  # Pixels spanning scan height (mm)
     
     # Image coordinates
     x_img_vec = x_step_m * np.arange(-(n_x_img-1)/2, (n_x_img-1)/2 + 1) * 1e-3
@@ -512,6 +543,11 @@ def main():
     parser.add_argument('--3d_scatter', dest='scatter3d', action='store_true', help='Generate interactive 3D scatter plot')
     parser.add_argument('--3d_scatter_intensity', dest='scatter3d_intensity', type=float, default=95.0, help='Initial percentile threshold for 3D scatter plot (0-100)')
     parser.add_argument('--plotly', action='store_true', help='Generate interactive Plotly HTML with Z-slider instead of Matplotlib window')
+    parser.add_argument('--gif', type=str, nargs='?', const='sar_slices.gif', default=None, metavar='FILE',
+                        help="Export Z-slice animation as a GIF (default name: sar_slices.gif). "
+                             "Skips the interactive viewer when set.")
+    parser.add_argument('--gif-fps', type=int, default=10,
+                        help="Frame rate for the GIF animation (default 10)")
     parser.add_argument('--algo', type=str, default='mf', choices=['mf', 'fista', 'bpa'], help="Reconstruction algorithm: 'mf' (Matched Filter), 'fista' (Fast Iterative Shrinkage-Thresholding), or 'bpa' (Back Projection)")
     parser.add_argument('--fista_iters', type=int, default=20, help="Number of FISTA iterations")
     parser.add_argument('--fista_lambda', type=float, default=0.05, help="FISTA regularization ratio (0.0 to 1.0)")
@@ -526,7 +562,9 @@ def main():
     parser.add_argument('--scan-width', type=float, default=280, help='Horizontal scan width in mm (default 280)')
     parser.add_argument('--scan-height', type=float, default=40, help='Vertical scan height in mm (default 40)')
     parser.add_argument('--filename-pattern', type=str, default='row_{y}_Raw_0.bin',
-                        help="Filename pattern for row data. Use {y} for 1-based row index "
+                        help="Filename pattern for row data. Use {y} for 1-based row index. "
+                             "If the file is missing, tries DCA1000 names: <stem>_Raw_0.bin, "
+                             "<stem>_Raw_1.bin, then <stem>_Raw*.bin (e.g. row_1.bin -> row_1_Raw_0.bin). "
                              "(default 'row_{y}_Raw_0.bin', legacy: 'scan{y}_Raw_0.bin')")
     parser.add_argument('--snake', action='store_true',
                         help="Enable snake/boustrophedon scan pattern (reverses even rows). "
@@ -651,21 +689,23 @@ def main():
         
         scan_width_x = args.scan_width
         scan_height_y = args.scan_height
-        
-        display_width_x = scan_width_x * 1.3
-        display_height_y = scan_height_y * 1.3
-        
+
+        # Reconstruct only within the physical scan rectangle (no extra margin beyond --scan-width/--scan-height)
         if args.algo == 'fista':
-             sar_image, x_axis, y_axis = reconstruct_sar_image_fista(sar_data, matched_filter, dx, dy, display_width_x, display_height_y, args.fista_iters, args.fista_lambda)
+             sar_image, x_axis, y_axis = reconstruct_sar_image_fista(
+                 sar_data, matched_filter, dx, dy, scan_width_x, scan_height_y,
+                 args.fista_iters, args.fista_lambda)
         elif args.algo == 'bpa':
-             sar_image, x_axis, y_axis = reconstruct_sar_image_bpa(raw_data_fft, dx, dy, z_mm, scan_width_x, scan_height_y, display_width_x, display_height_y)
+             sar_image, x_axis, y_axis = reconstruct_sar_image_bpa(
+                 raw_data_fft, dx, dy, z_mm, scan_width_x, scan_height_y,
+                 scan_width_x, scan_height_y)
         else:
-             sar_image, x_axis, y_axis = reconstruct_sar_image(sar_data, matched_filter, dx, dy, display_width_x, display_height_y)
-        
+             sar_image, x_axis, y_axis = reconstruct_sar_image(
+                 sar_data, matched_filter, dx, dy, scan_width_x, scan_height_y)
+
         # Shift axes so that (0,0) corresponds to the bottom-left of the physical scan area
-        if args.algo != 'bpa': # BPA already returns centered axes
-            x_axis += scan_width_x / 2
-            y_axis += scan_height_y / 2
+        x_axis = np.asarray(x_axis) + scan_width_x / 2
+        y_axis = np.asarray(y_axis) + scan_height_y / 2
         
         # Store magnitude
         # MATLAB: fliplr(sarImage)
@@ -684,6 +724,7 @@ def main():
     use_db = args.db
     db_range = args.db_range
     clabel = 'dB' if use_db else 'Intensity'
+    sw, sh = args.scan_width, args.scan_height
 
     # Generate Heatmaps
     print(f"Generating Heatmaps{' (dB scale, ' + str(db_range) + ' dB range)' if use_db else ''}...")
@@ -699,6 +740,7 @@ def main():
         plt.ylabel('Depth Z (mm)')
         plt.title('SAR X-Z Maximum Intensity Projection')
         plt.colorbar(label=clabel)
+        plt.xlim(0, sw)
         plt.savefig('sar_heatmap_xz.png')
         print("Saved X-Z heatmap to sar_heatmap_xz.png")
 
@@ -713,6 +755,7 @@ def main():
         plt.ylabel('Depth Z (mm)')
         plt.title('SAR Y-Z Maximum Intensity Projection')
         plt.colorbar(label=clabel)
+        plt.xlim(0, sh)
         plt.savefig('sar_heatmap_yz.png')
         print("Saved Y-Z heatmap to sar_heatmap_yz.png")
 
@@ -726,6 +769,8 @@ def main():
     plt.ylabel('Vertical (mm)')
     plt.title('SAR X-Y Maximum Intensity Projection (All Z)')
     plt.axis('equal')
+    plt.xlim(0, sw)
+    plt.ylim(0, sh)
     plt.colorbar(label=clabel)
     plt.savefig('sar_heatmap_xy_max.png')
     print("Saved X-Y max projection to sar_heatmap_xy_max.png")
@@ -839,6 +884,8 @@ def main():
                     xaxis_title='Horizontal (mm)',
                     yaxis_title='Vertical (mm)',
                     zaxis_title='Depth Z (mm)',
+                    xaxis=dict(range=[0, args.scan_width]),
+                    yaxis=dict(range=[0, args.scan_height]),
                     aspectmode='data' # Preserve aspect ratio
                 ),
                 margin=dict(l=0, r=0, b=0, t=40),
@@ -856,7 +903,54 @@ def main():
             except Exception:
                 pass
 
-    # 4. Interactive Slider Plot (or single Z display)
+    # 4. GIF export (Z-slice animation)
+    if args.gif:
+        from io import BytesIO
+        from PIL import Image
+
+        gif_path = get_unique_filename(args.gif)
+        fps = max(1, args.gif_fps)
+        duration_ms = int(1000 / fps)
+
+        cmin = float(np.min(sar_stack))
+        cmax = float(np.max(sar_stack))
+
+        print(f"Rendering {len(z_values)} frames for GIF at {fps} fps...")
+        pil_frames = []
+        for i, z_val in enumerate(z_values):
+            slice_data = sar_stack[i]
+            if use_db:
+                slice_data = to_db(slice_data, db_range)
+
+            fig_gif, ax_gif = plt.subplots(figsize=(10, 8))
+            mesh_gif = ax_gif.pcolormesh(
+                x_axis, y_axis, slice_data, cmap='jet', shading='gouraud',
+                vmin=(to_db(np.array([cmin]), db_range)[0] if use_db else cmin),
+                vmax=(0.0 if use_db else cmax))
+            ax_gif.set_xlabel('Horizontal (mm)')
+            ax_gif.set_ylabel('Vertical (mm)')
+            ax_gif.set_title(f'SAR Image at Z = {z_val:.1f} mm')
+            ax_gif.axis('equal')
+            ax_gif.set_xlim(0, sw)
+            ax_gif.set_ylim(0, sh)
+            fig_gif.colorbar(mesh_gif, ax=ax_gif, label=clabel)
+
+            buf = BytesIO()
+            fig_gif.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            plt.close(fig_gif)
+            buf.seek(0)
+            pil_frames.append(Image.open(buf).copy())
+            buf.close()
+
+            if (i + 1) % 10 == 0 or (i + 1) == len(z_values):
+                print(f"  Rendered {i + 1}/{len(z_values)} frames")
+
+        pil_frames[0].save(
+            gif_path, save_all=True, append_images=pil_frames[1:],
+            duration=duration_ms, loop=0)
+        print(f"Saved GIF ({len(pil_frames)} frames, {fps} fps) to {gif_path}")
+
+    # 5. Interactive Slider Plot (or single Z display)
     if args.plotly:
         print("Generating Interactive Plotly Slice Viewer...")
         try:
@@ -889,8 +983,10 @@ def main():
             )],
             layout=go.Layout(
                 title=f"SAR Reconstruction (Z={z_values[initial_idx]}mm)",
-                xaxis=dict(title="Horizontal (mm)", scaleanchor="y", scaleratio=1),
-                yaxis=dict(title="Vertical (mm)"),
+                xaxis=dict(
+                    title="Horizontal (mm)", scaleanchor="y", scaleratio=1,
+                    range=[0, args.scan_width]),
+                yaxis=dict(title="Vertical (mm)", range=[0, args.scan_height]),
                 updatemenus=[dict(
                     type="buttons",
                     buttons=[dict(label="Play",
@@ -942,7 +1038,7 @@ def main():
         except Exception:
             pass
 
-    else:
+    elif not args.gif:
         print("Opening interactive inspector (Matplotlib)...")
 
         single_z_mode = (len(z_values) == 1)
@@ -958,6 +1054,8 @@ def main():
             ax_int.set_ylabel('Vertical (mm)')
             title_obj = ax_int.set_title(f'SAR Image at Z = {z_values[idx]} mm')
             ax_int.axis('equal')
+            ax_int.set_xlim(0, args.scan_width)
+            ax_int.set_ylim(0, args.scan_height)
             fig_int.colorbar(mesh, ax=ax_int, label='Intensity')
             plt.show()
         else:
@@ -968,6 +1066,8 @@ def main():
             ax_int.set_ylabel('Vertical (mm)')
             title_obj = ax_int.set_title(f'SAR Image at Z = {z_values[initial_idx]} mm')
             ax_int.axis('equal')
+            ax_int.set_xlim(0, args.scan_width)
+            ax_int.set_ylim(0, args.scan_height)
             fig_int.colorbar(mesh, ax=ax_int, label='Intensity')
 
             ax_slider = plt.axes([0.25, 0.1, 0.65, 0.03])
