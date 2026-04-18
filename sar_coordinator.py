@@ -9,9 +9,13 @@ Recommended setup:
   - Pi gantry client connects over the local network (~1-5ms latency)
 
 Usage:
-    python sar_coordinator.py -W 280 -H 40 -r 40 -o "C:\\path\\to\\data"
-    python sar_coordinator.py -W 280 -H 40 -x 0 -y 0 -r 40 -s 18 --return-speed 36 -o "C:\\data"
-    python sar_coordinator.py -W 280 -H 40 -r 40 --snake -o "C:\\data"   # boustrophedon (use sar_reconstruct.py --snake)
+    python sar_coordinator.py
+        # No args: same as -W 150 -H 150 -s 25 --return-speed 60 --y-step 1
+        #          --frame-periodicity 40 -o <this_repo>/outputs -p 5555 --snake
+        #          (rows = floor(H / y-step) + 1 from height and y-step)
+    python sar_coordinator.py -W 280 -H 40 -o "C:\\path\\to\\outputs" --y-step 1
+
+Each run creates a new subfolder scan_N under -o (N = highest existing scan_* + 1, or 0 if none).
 
 Protocol (newline-delimited text, two persistent TCP connections):
 
@@ -24,12 +28,15 @@ Protocol (newline-delimited text, two persistent TCP connections):
     Client sends: GANTRY | MOTOR_STARTED | MOVE_COMPLETE | PONG | ERROR <msg>
 """
 
-import socket
-import threading
 import argparse
+import math
 import os
+import re
+import socket
 import sys
+import threading
 import time
+from pathlib import Path
 
 
 class ClientConnection:
@@ -116,6 +123,34 @@ def accept_clients(server_sock, timeout=120):
     return clients["GANTRY"], clients["RADAR"]
 
 
+def next_scan_output_dir(outputs_base: Path) -> Path:
+    """Return outputs_base/scan_N (N = max existing scan_* + 1, or 0 if none)."""
+    base = outputs_base.expanduser().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    max_n = -1
+    pat = re.compile(r"^scan_(\d+)$")
+    for p in base.iterdir():
+        if p.is_dir():
+            m = pat.match(p.name)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    n = max_n + 1
+    out = base / f"scan_{n}"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def num_rows_from_height_step(height: float, y_step: float) -> int:
+    """Rows along Y: (num_rows - 1) * y_step spans *height* (matches y_step = height/(N-1))."""
+    if y_step <= 0:
+        raise ValueError("y-step must be positive")
+    if height < 0:
+        raise ValueError("height must be non-negative")
+    if height == 0:
+        return 1
+    return max(1, int(math.floor(height / y_step)) + 1)
+
+
 # ---------------------------------------------------------------------------
 # Scan execution
 # ---------------------------------------------------------------------------
@@ -125,7 +160,6 @@ def run_scan(gantry, radar, args):
     height = args.height
     x_start = args.x_start
     y_start = args.y_start
-    num_rows = args.rows
     speed = args.speed
     return_speed = args.return_speed
     frame_periodicity = args.frame_periodicity
@@ -133,9 +167,8 @@ def run_scan(gantry, radar, args):
     output_dir = args.output_dir
     snake = args.snake
 
-    y_step = args.y_step if args.y_step is not None else (
-        height / (num_rows - 1) if num_rows > 1 else 0
-    )
+    y_step = args.y_step
+    num_rows = num_rows_from_height_step(height, y_step)
 
     if args.num_frames is not None:
         num_frames = args.num_frames
@@ -314,41 +347,50 @@ def main():
     parser = argparse.ArgumentParser(
         description="SAR Scan Coordinator — synchronize radar capture with gantry movement"
     )
-    parser.add_argument("-W", "--width", type=float, required=True,
-                        help="Horizontal scan distance per row (mm)")
-    parser.add_argument("-H", "--height", type=float, required=True,
-                        help="Total vertical scan distance (mm)")
+    parser.add_argument("-W", "--width", type=float, default=150,
+                        help="Horizontal scan distance per row (mm, default 150)")
+    parser.add_argument("-H", "--height", type=float, default=150,
+                        help="Total vertical scan distance (mm, default 150)")
     parser.add_argument("-x", "--x-start", type=float, default=0,
                         help="X start position (mm, default 0)")
     parser.add_argument("-y", "--y-start", type=float, default=0,
                         help="Y start position (mm, default 0)")
-    parser.add_argument("-r", "--rows", type=int, required=True,
-                        help="Number of scan rows")
-    parser.add_argument("-s", "--speed", type=float, default=18,
-                        help="Scan speed (mm/s, default 18)")
-    parser.add_argument("--return-speed", type=float, default=36,
-                        help="Gantry return speed after each row (mm/s, default 36; unused with --snake)")
-    parser.add_argument("--snake", action="store_true",
-                        help="Boustrophedon scan: odd rows left→right, even rows right→left; "
-                             "no return move between rows (reconstruct with sar_reconstruct.py --snake)")
+    parser.add_argument("-s", "--speed", type=float, default=25,
+                        help="Scan speed (mm/s, default 25)")
+    parser.add_argument("--return-speed", type=float, default=60,
+                        help="Gantry return speed after each row (mm/s, default 60; unused with --snake)")
+    parser.add_argument(
+        "--snake",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Boustrophedon scan (default: on). Use --no-snake for return-after-each-row raster",
+    )
     parser.add_argument("--dca-record-gap", type=float, default=3.0, metavar="SEC",
                         help="Seconds to wait after each capture before the next move/ARM when "
                              "using --snake (DCA1000 needs a gap after StopRecord; default: 3). "
                              "Raster mode gets this gap implicitly from the return traverse.")
-    parser.add_argument("--y-step", type=float, default=None,
-                        help="Y step between rows (mm, overrides height-based calc)")
+    parser.add_argument("--y-step", type=float, default=1,
+                        help="Y step between rows (mm, default 1)")
     parser.add_argument("--num-frames", type=int, default=None,
                         help="Frames per capture (default: auto from scan time)")
-    parser.add_argument("--frame-periodicity", type=float, default=18,
-                        help="Radar frame periodicity (ms, default 18)")
+    parser.add_argument("--frame-periodicity", type=float, default=40,
+                        help="Radar frame periodicity (ms, default 40)")
     parser.add_argument("--stabilization", type=float, default=0,
                         help="Motor stabilization delay before capture (ms, default 500)")
-    parser.add_argument("-o", "--output-dir", type=str, required=True,
-                        help="Output directory for .bin files (Windows path)")
+    _default_outputs = str(Path(__file__).resolve().parent / "outputs")
+    parser.add_argument(
+        "-o", "--output-dir",
+        type=str,
+        default=_default_outputs,
+        help=f"Parent folder for scan runs; each run writes to a new scan_N subfolder here (default: {_default_outputs})",
+    )
     parser.add_argument("-p", "--port", type=int, default=5555,
                         help="TCP server port (default 5555)")
 
     args = parser.parse_args()
+
+    out_path = next_scan_output_dir(Path(args.output_dir))
+    args.output_dir = str(out_path)
 
     # Try to create output directory (works when coordinator runs on Windows)
     try:
