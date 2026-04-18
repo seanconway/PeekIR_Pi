@@ -170,11 +170,7 @@ def run_scan(gantry, radar, args):
     y_step = args.y_step
     num_rows = num_rows_from_height_step(height, y_step)
 
-    if args.num_frames is not None:
-        num_frames = args.num_frames
-    else:
-        scan_time_ms = (width / speed) * 1000
-        num_frames = int(scan_time_ms / frame_periodicity) + 10
+    num_frames = compute_num_frames(args)
 
     # Detect Windows vs POSIX path separator from user-supplied output dir
     sep = "\\" if "\\" in output_dir else "/"
@@ -343,10 +339,16 @@ def run_scan(gantry, radar, args):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description="SAR Scan Coordinator — synchronize radar capture with gantry movement"
-    )
+def build_parser(parser=None):
+    """Build (or extend) the coordinator argument parser.
+
+    Passing an existing ``ArgumentParser`` adds the coordinator arguments to it
+    (used by ``sar_complete.py`` which adds reconstruction-only flags on top).
+    """
+    if parser is None:
+        parser = argparse.ArgumentParser(
+            description="SAR Scan Coordinator — synchronize radar capture with gantry movement"
+        )
     parser.add_argument("-W", "--width", type=float, default=150,
                         help="Horizontal scan distance per row (mm, default 150)")
     parser.add_argument("-H", "--height", type=float, default=150,
@@ -386,7 +388,19 @@ def main():
     )
     parser.add_argument("-p", "--port", type=int, default=5555,
                         help="TCP server port (default 5555)")
+    return parser
 
+
+def compute_num_frames(args):
+    """Return the frame count that ``run_scan`` will use, given CLI args."""
+    if args.num_frames is not None:
+        return args.num_frames
+    scan_time_ms = (args.width / args.speed) * 1000
+    return int(scan_time_ms / args.frame_periodicity) + 10
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     out_path = next_scan_output_dir(Path(args.output_dir))
